@@ -165,7 +165,17 @@ bool ClosestPos::SDK_OnLoad(char* error, size_t maxlength, bool late)
 	Dl_info info;
 	// memutils is from sourcemod.logic.so so we can grab the module from it.
 	dladdr(memutils, &info);
-	void *sourcemod_logic = dlopen(info.dli_fname, RTLD_NOW);
+#ifndef RTLD_NOLOAD
+#define RTLD_NOLOAD 0x00004
+#endif
+	// [fork patch] sourcemod.logic.so is ALREADY loaded by SM at this point.
+	// Upstream uses RTLD_NOW, which forces re-resolution of all of logic.so's
+	// symbols; that fails on some setups (observed: CS:S + SM 1.12 / Debian 12)
+	// because SM loads logic.so with locally-scoped symbols. RTLD_NOLOAD fetches
+	// the existing handle with no re-resolution. Keep RTLD_NOW as a fallback.
+	void *sourcemod_logic = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_LAZY);
+	if (!sourcemod_logic)
+		sourcemod_logic = dlopen(info.dli_fname, RTLD_NOW);
 
 	if (!sourcemod_logic)
 	{

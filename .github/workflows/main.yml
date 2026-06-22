@@ -1,118 +1,103 @@
-name: build
+name: build-and-release
+
+# Builds the Linux 32-bit extension and, on a version tag (v*), publishes a
+# GitHub Release with the .so attached. Upstream/eIIdot only upload CI artifacts
+# and never cut a release, so there is no binary for people to download — this
+# fixes that.
 
 on:
   push:
-    paths-ignore:
-    - LICENSE
-    - README.md
+    branches: [ main ]
+    tags: [ 'v*' ]
+    paths-ignore: [ 'LICENSE', 'README.md' ]
   pull_request:
-    paths-ignore:
-    - LICENSE
-    - README.md
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: build with sm${{ matrix.sm_version }} on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  build-linux:
+    name: Build Linux 32-bit (SourceMod ${{ matrix.sm }})
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write          # required so the release step can create the release
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-20.04
-          #- ubuntu-18.04
-          - windows-latest
-          
-        sm_version:
-          - "1.10"
-          
         include:
-          - sm_version: "1.10"
-            branch: "1.10-dev"
-            
-          - os: ubuntu-20.04
-            
-          #- os: ubuntu-18.04
-            
-          - os: windows-latest
-            
+          - sm: '1.12'
+            sm_branch: '1.12-dev'
     steps:
-      - name: Prepare env
-        shell: bash
-        run: |
-          echo "GITHUB_SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
-          
-      - name: Install (Linux)
-        if: runner.os == 'Linux'
+      - name: Checkout sm_closestpos
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install 32-bit toolchain + ambuild
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y clang g++-multilib
-          echo "CC=clang" >> $GITHUB_ENV
-          echo "CXX=clang++" >> $GITHUB_ENV
-          
-      - name: Add msbuild to PATH (Windows)
-        if: runner.os == 'Windows'
-        uses: microsoft/setup-msbuild@v1.0.2
-        
-      - name: Install (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          :: See https://github.com/microsoft/vswhere/wiki/Find-VC
-          for /f "usebackq delims=*" %%i in (`vswhere -latest -property installationPath`) do (
-            call "%%i"\Common7\Tools\vsdevcmd.bat -arch=x86 -host_arch=x64
-          )
-          
-          :: Loop over all environment variables and make them global.
-          for /f "delims== tokens=1,2" %%a in ('set') do (
-            echo>>"%GITHUB_ENV%" %%a=%%b
-          )
-          
-      - name: Checking out SourceMod
-        uses: actions/checkout@v2
+          sudo apt-get install -y clang g++-multilib gcc-multilib python3 python3-pip git zip
+          git clone --depth 1 https://github.com/alliedmodders/ambuild
+          pip3 install ./ambuild
+
+      - name: Checkout SourceMod ${{ matrix.sm }}
+        uses: actions/checkout@v4
         with:
           repository: alliedmodders/sourcemod
-          ref: ${{ matrix.branch }}
-          path: sourcemod-${{ matrix.sm_version }}
+          ref: ${{ matrix.sm_branch }}
+          path: sourcemod
           submodules: recursive
-          
-      - name: Checking out MM:Source
-        uses: actions/checkout@v2
+
+      - name: Checkout Metamod:Source ${{ matrix.sm }}
+        uses: actions/checkout@v4
         with:
           repository: alliedmodders/metamod-source
-          ref: ${{ matrix.branch }}
-          path: metamod-${{ matrix.sm_version }}
-          
-      - name: Checking out AMBuild
-        uses: actions/checkout@v2
-        with:
-          repository: alliedmodders/ambuild
-          path: ambuild
-          
-      - name: Setting up Python
-        uses: actions/setup-python@v2
-        
-      - name: Setting up ambuild
-        working-directory: ambuild
-        run: |
-          python -m pip install setuptools wheel
-          python setup.py install
-          
-      - name: Checking out own repository
-        uses: actions/checkout@v2
-        with:
-          path: sm_closestpos
+          ref: ${{ matrix.sm_branch }}
+          path: mmsource
+          submodules: recursive
 
-      - name: Compiling sm_closestpos files
-        working-directory: sm_closestpos
+      - name: Configure & build
         run: |
-          mkdir build
-          cd build
-          python ../configure.py --enable-optimize --sm-path="${{ github.workspace }}/sourcemod-${{ matrix.sm_version }}" --mms-path="${{ github.workspace }}/metamod-${{ matrix.sm_version }}"
+          mkdir build && cd build
+          CC=clang CXX=clang++ python3 ../configure.py --enable-optimize \
+            --sm-path="$GITHUB_WORKSPACE/sourcemod" \
+            --mms-path="$GITHUB_WORKSPACE/mmsource"
           ambuild
-          
-      - name: Uploading package
-        uses: actions/upload-artifact@v2
+
+      - name: Verify artifact is ELF 32-bit
+        run: |
+          SO=build/package/addons/sourcemod/extensions/closestpos.ext.so
+          file "$SO"
+          file -b "$SO" | grep -q 'ELF 32-bit.*Intel 80386'
+
+      - name: Package zip
+        run: |
+          cd build/package
+          zip -r "$GITHUB_WORKSPACE/sm_closestpos-sm${{ matrix.sm }}-linux-x86.zip" .
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: sm_closestpos-sm${{ matrix.sm_version }}-${{ matrix.os }}-${{ env.GITHUB_SHA_SHORT }}
-          path: sm_closestpos/build/package
+          name: sm_closestpos-sm${{ matrix.sm }}-linux-x86
+          path: build/package
+
+      - name: Publish release (on v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sm_closestpos-sm${{ matrix.sm }}-linux-x86.zip
+            build/package/addons/sourcemod/extensions/closestpos.ext.so
+          generate_release_notes: true
+          body: |
+            **Linux 32-bit build of sm_closestpos with the `RTLD_NOLOAD` fix.**
+
+            Upstream's `SDK_OnLoad()` re-opens `sourcemod.logic.so` with `RTLD_NOW`
+            purely to fetch a handle for `memutils->ResolveSymbol("g_pCoreIdent")`.
+            `RTLD_NOW` forces re-resolution of all of logic.so's symbols, which fails
+            on setups where SourceMod loaded it with locally-scoped symbols (observed:
+            CS:S + SourceMod 1.12 on modern Linux -> "dlopen failed on logic.so").
+            logic.so is always already loaded at this point, so `RTLD_NOLOAD` returns
+            the existing handle with no re-resolution.
+
+            Built against **SourceMod ${{ matrix.sm }}** (loads on 1.11/1.12+).
+            Install: drop `closestpos.ext.so` into `addons/sourcemod/extensions/`.
